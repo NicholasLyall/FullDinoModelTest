@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SAM 3 — Open-Vocabulary Video Detector</title>
+<style>
+  :root { --bg:#0f1115; --panel:#1a1d24; --fg:#e6e8ec; --muted:#9aa0ab;
+          --accent:#5b8def; --ok:#3ecf8e; --err:#ff6b6b; --border:#2a2f3a; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+         background:var(--bg); color:var(--fg); }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); }
+  header h1 { margin:0; font-size:18px; }
+  header p { margin:4px 0 0; color:var(--muted); font-size:13px; }
+  main { max-width:1100px; margin:0 auto; padding:20px 24px 120px; }
+  .banner { padding:10px 14px; border-radius:8px; margin-bottom:16px; font-size:13px;
+            display:none; }
+  .banner.warn { background:#3a2a12; border:1px solid #6b4a1a; color:#ffcf8e; display:block; }
+  .banner.ok { background:#12291d; border:1px solid #1e5a3a; color:#8ee7b6; display:block; }
+  .stage { background:#000; border:1px solid var(--border); border-radius:10px;
+           overflow:hidden; aspect-ratio:16/9; display:flex; align-items:center;
+           justify-content:center; }
+  .stage video, .stage img { width:100%; height:100%; object-fit:contain; background:#000; }
+  .stage .placeholder { color:var(--muted); }
+  .counts { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; min-height:30px; }
+  .chip { display:flex; align-items:center; gap:8px; background:var(--panel);
+          border:1px solid var(--border); border-radius:999px; padding:5px 12px; font-size:13px; }
+  .chip .dot { width:10px; height:10px; border-radius:50%; }
+  .chip b { color:var(--accent); }
+  .progress { height:6px; background:var(--panel); border-radius:4px; overflow:hidden;
+              margin-top:14px; display:none; }
+  .progress > div { height:100%; width:0; background:var(--accent); transition:width .2s; }
+  .statusline { margin-top:8px; color:var(--muted); font-size:12px; min-height:16px; }
+  .controls { position:fixed; left:0; right:0; bottom:0; background:var(--panel);
+              border-top:1px solid var(--border); padding:14px 24px; }
+  .controls .row { max-width:1100px; margin:0 auto; display:flex; gap:12px; align-items:flex-end;
+                   flex-wrap:wrap; }
+  label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  input[type=text], select { background:var(--bg); border:1px solid var(--border);
+        color:var(--fg); border-radius:8px; padding:9px 11px; font-size:14px; }
+  .prompt-wrap { flex:1; min-width:220px; }
+  .prompt-wrap input { width:100%; }
+  input[type=range] { width:130px; vertical-align:middle; }
+  button { background:var(--accent); color:#fff; border:0; border-radius:8px;
+           padding:10px 18px; font-size:14px; font-weight:600; cursor:pointer; }
+  button.stop { background:var(--err); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .small { font-size:12px; color:var(--muted); }
+  .thr-val { color:var(--fg); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>SAM 3 · Open-Vocabulary Video Detector</h1>
+  <p>Type comma-separated things to find (e.g. <code>car, person, truck</code>). Boxes only — masks ignored.</p>
+</header>
+
+<main>
+  <div id="banner" class="banner"></div>
+
+  <div class="stage">
+    <video id="player" controls playsinline style="display:none"></video>
+    <img id="liveImg" alt="live detection" style="display:none">
+    <div id="placeholder" class="placeholder">Pick a mode, video and prompt, then press the button.</div>
+  </div>
+
+  <div class="progress" id="progressWrap"><div id="progressBar"></div></div>
+  <div class="statusline" id="statusline"></div>
+  <div class="counts" id="counts"></div>
+</main>
+
+<div class="controls">
+  <div class="row">
+    <div>
+      <label>Mode</label>
+      <select id="modeSelect">
+        <option value="sam3">SAM 3 — processed (accurate, ~0.7 fps)</option>
+        <option value="live">YOLOE — live (fast, ~7–8 fps)</option>
+      </select>
+    </div>
+    <div>
+      <label>Video (in ./input/)</label>
+      <select id="videoSelect"></select>
+    </div>
+    <div>
+      <label>Upload</label>
+      <input type="file" id="fileInput" accept="video/*">
+    </div>
+    <div class="prompt-wrap">
+      <label>Prompt — comma-separated concepts</label>
+      <input type="text" id="prompt" placeholder="car, person, truck" value="car, person, truck">
+    </div>
+    <div>
+      <label>Threshold <span class="thr-val" id="thrVal">0.40</span></label>
+      <input type="range" id="threshold" min="0.05" max="0.95" step="0.05" value="0.40">
+    </div>
+    <div>
+      <label>Frame stride</label>
+      <input type="text" id="stride" value="3" style="width:60px">
+    </div>
+    <button id="detectBtn">Detect</button>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let pollTimer = null;
+let liveOn = false;
+
+function banner(msg, kind="warn") {
+  const b = $("banner");
+  if (!msg) { b.style.display = "none"; return; }
+  b.className = "banner " + kind;
+  b.innerHTML = msg;
+}
+
+function colorForId(id) {           // mirror of server golden-ratio palette
+  const h = ((id * 0.61803398875) % 1.0) * 360;
+  return `hsl(${h.toFixed(0)} 70% 60%)`;
+}
+
+function mode() { return $("modeSelect").value; }
+
+// Button label + sensible stride default per mode.
+function syncMode() {
+  if (liveOn) return;               // don't relabel mid-stream
+  if (mode() === "live") {
+    $("detectBtn").textContent = "Start live";
+    if ($("stride").value === "3") $("stride").value = "1";
+  } else {
+    $("detectBtn").textContent = "Detect";
+    if ($("stride").value === "1") $("stride").value = "3";
+  }
+}
+$("modeSelect").addEventListener("change", () => { if (liveOn) stopLive(); syncMode(); });
+
+async function refreshStatus() {
+  const r = await fetch("/status"); const s = await r.json();
+  const sel = $("videoSelect");
+  sel.innerHTML = "";
+  for (const v of s.videos) {
+    const o = document.createElement("option"); o.value = v; o.textContent = v; sel.appendChild(o);
+  }
+  if (!s.videos.length) {
+    const o = document.createElement("option"); o.textContent = "(no videos — upload one)"; o.disabled = true; sel.appendChild(o);
+  }
+  // Prefer the 10s clip if present (built for the SAM 3 processed run).
+  if (s.videos.includes("clip_10s.mp4")) $("videoSelect").value = "clip_10s.mp4";
+  $("detectBtn").disabled = false;
+  if (!s.sam3_available) {
+    banner(`SAM 3 weights not present — the processed mode will fall back to
+      <b>${s.active_label}</b>. Drop <code>sam3.pt</code> in the project root to enable real SAM 3.`, "warn");
+  } else {
+    banner(`SAM 3 ready. <b>Processed</b> mode = SAM 3 · <b>Live</b> mode = ${s.yoloe_model}.`, "ok");
+  }
+}
+
+$("threshold").addEventListener("input", e => $("thrVal").textContent = (+e.target.value).toFixed(2));
+
+$("fileInput").addEventListener("change", async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  $("statusline").textContent = "Uploading…";
+  const r = await fetch("/upload", { method:"POST", body:fd });
+  if (r.ok) { const j = await r.json(); await refreshStatus(); $("videoSelect").value = j.saved;
+              $("statusline").textContent = "Uploaded " + j.saved; }
+  else { $("statusline").textContent = "Upload failed"; }
+});
+
+function renderCounts(counts) {
+  const el = $("counts"); el.innerHTML = "";
+  for (const [cls, c] of Object.entries(counts || {})) {
+    const chip = document.createElement("div"); chip.className = "chip";
+    chip.innerHTML = `<span class="dot" style="background:${colorForId(cls.length)}"></span>
+      ${cls}: <b>${c.total}</b> total <span class="small">(${c.current} now)</span>`;
+    el.appendChild(chip);
+  }
+}
+
+// ---------------- Processed mode (SAM 3) ----------------
+async function poll(jobId) {
+  const r = await fetch(`/progress/${jobId}`);
+  if (!r.ok) { clearInterval(pollTimer); return; }
+  const j = await r.json();
+  renderCounts(j.counts);
+  const pct = j.total ? Math.min(100, Math.round(100 * j.processed / j.total)) : 0;
+  $("progressBar").style.width = pct + "%";
+
+  if (j.status === "running")  $("statusline").textContent = `Detecting… frame ${j.processed}/${j.total} (${pct}%)`;
+  if (j.status === "encoding") $("statusline").textContent = "Encoding browser-playable video…";
+  if (j.status === "error")  {
+    clearInterval(pollTimer);
+    $("statusline").textContent = "Error: " + j.error;
+    $("detectBtn").disabled = false;
+    $("progressWrap").style.display = "none";
+    if (j.output) {                    // partial video was still saved — let them watch it
+      const v = $("player");
+      v.src = j.output + "?t=" + Date.now();
+      v.style.display = "block"; $("liveImg").style.display = "none"; $("placeholder").style.display = "none";
+      v.load(); v.play().catch(()=>{});
+    }
+  }
+  if (j.status === "done") {
+    clearInterval(pollTimer);
+    $("statusline").textContent = "Done.";
+    $("progressWrap").style.display = "none";
+    const v = $("player");
+    v.src = j.output + "?t=" + Date.now();   // cache-bust
+    v.style.display = "block"; $("liveImg").style.display = "none"; $("placeholder").style.display = "none";
+    v.load(); v.play().catch(()=>{});
+    $("detectBtn").disabled = false;
+  }
+}
+
+async function startProcessed(video, prompt) {
+  $("detectBtn").disabled = true;
+  $("player").style.display = "none"; $("liveImg").style.display = "none";
+  $("placeholder").style.display = "block"; $("placeholder").textContent = "Processing…";
+  $("progressWrap").style.display = "block"; $("progressBar").style.width = "0%";
+  $("counts").innerHTML = ""; $("statusline").textContent = "Starting…";
+
+  const body = { prompt, video, backend: "sam3",
+                 score_threshold: +$("threshold").value,
+                 frame_stride: parseInt($("stride").value) || 1 };
+  const r = await fetch("/detect", { method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body) });
+  if (!r.ok) { const e = await r.json().catch(()=>({detail:"failed"}));
+               $("statusline").textContent = "Error: " + (e.detail || r.status);
+               $("detectBtn").disabled = false; $("progressWrap").style.display="none"; return; }
+  const { job_id } = await r.json();
+  pollTimer = setInterval(() => poll(job_id), 600);
+}
+
+// ---------------- Live mode (YOLOE) ----------------
+function startLive(video, prompt) {
+  const q = new URLSearchParams({ video, prompt, backend: "yoloe",
+      score_threshold: $("threshold").value,
+      frame_stride: String(parseInt($("stride").value) || 1) });
+  const img = $("liveImg");
+  img.onerror = () => { $("statusline").textContent = "Live stream ended or failed."; stopLive(); };
+  img.src = "/live?" + q.toString() + "&_=" + Date.now();
+  img.style.display = "block"; $("player").style.display = "none"; $("placeholder").style.display = "none";
+  $("progressWrap").style.display = "none"; $("counts").innerHTML = "";
+  $("statusline").textContent = "Live — boxes & counts are drawn on the video. Press Stop to end.";
+  liveOn = true;
+  $("detectBtn").textContent = "Stop"; $("detectBtn").classList.add("stop");
+}
+
+function stopLive() {
+  const img = $("liveImg");
+  img.onerror = null;
+  img.src = "";                     // closes the MJPEG connection -> server releases the GPU
+  img.style.display = "none"; $("placeholder").style.display = "block";
+  $("placeholder").textContent = "Live stopped.";
+  liveOn = false;
+  $("detectBtn").textContent = "Start live"; $("detectBtn").classList.remove("stop");
+  $("statusline").textContent = "Stopped.";
+}
+
+// ---------------- Button ----------------
+$("detectBtn").addEventListener("click", async () => {
+  if (mode() === "live") {
+    if (liveOn) { stopLive(); return; }
+    const video = $("videoSelect").value, prompt = $("prompt").value.trim();
+    if (!video || !prompt) { $("statusline").textContent = "Pick a video and type a prompt."; return; }
+    startLive(video, prompt);
+    return;
+  }
+  const video = $("videoSelect").value, prompt = $("prompt").value.trim();
+  if (!video || !prompt) { $("statusline").textContent = "Pick a video and type a prompt."; return; }
+  startProcessed(video, prompt);
+});
+
+refreshStatus();
+syncMode();
+</script>
+</body>
+</html>

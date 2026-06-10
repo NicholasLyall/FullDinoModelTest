@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Model weights (large; re-downloaded on demand — see README)
+*.pt
+mobileclip2_b.ts
+
+# Local data / runtime
+input/
+output/
+.claude/settings.local.json
