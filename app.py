@@ -140,9 +140,6 @@ class Sam3Engine:
 
     name = "sam3"
     label = "SAM 3 (native video tracking)"
-    # SAM 3's ViT uses a 14-px patch (native input 1008 = 72*14), so imgsz must be a
-    # multiple of 14. 840 ≈ 70% of native pixel count — drop to 672 if still tight.
-    DEFAULT_IMGSZ = 840
     # VRAM scales with the number of CONCURRENTLY tracked objects: every live object
     # carries its own SAM2-style tracker state (memory features + object pointers),
     # and memory-attention runs over all of them each frame. Upstream hardcodes
@@ -176,7 +173,7 @@ class Sam3Engine:
             conf=0.4,
             task="segment",
             mode="predict",
-            imgsz=self.DEFAULT_IMGSZ,
+            imgsz=1008,  # SAM 3's native input (72 × 14-px ViT patches)
             model=str(MODEL_PATH),
             half=True,        # FP16 — fits the 8 GB Blackwell card
             device=0,         # GPU
@@ -189,15 +186,12 @@ class Sam3Engine:
         self._predictor.max_num_objects = self.MAX_TRACKED_OBJECTS
         return self._predictor
 
-    def stream(self, video_path: str, concepts: list[str], conf: float, stride: int,
-               imgsz: int | None = None):
+    def stream(self, video_path: str, concepts: list[str], conf: float, stride: int):
         """Yield (result, predictor) per processed frame. Serialized: one job at a time."""
         with self._lock:
             predictor = self._load()
             predictor.args.conf = float(conf)
             predictor.args.vid_stride = int(max(1, stride))
-            size = int(imgsz or self.DEFAULT_IMGSZ)
-            predictor.args.imgsz = max(14, 14 * round(size / 14))  # snap to ViT patch grid
             # SAM 3 names map class index -> concept string for this run.
             for result in predictor(source=video_path, text=concepts, stream=True):
                 yield result
@@ -221,23 +215,19 @@ class YoloeEngine:
             self._model = YOLOE(YOLOE_MODEL)
         return self._model
 
-    def stream(self, video_path: str, concepts: list[str], conf: float, stride: int,
-               imgsz: int | None = None):
+    def stream(self, video_path: str, concepts: list[str], conf: float, stride: int):
         """Yield per-frame Results. .track keeps persistent IDs across the clip."""
         with self._lock:
             model = self._load()
             # Set the open-vocabulary concepts for this run.
             model.set_classes(concepts, model.get_text_pe(concepts))
-            track_kw = dict(
+            # FP32: YOLOE-x is tiny (fits easily) and its FP32 text embeddings would
+            # otherwise clash with a half-precision model (Half != float dtype error).
+            for result in model.track(
                 source=video_path, stream=True, persist=True,
                 conf=float(conf), vid_stride=int(max(1, stride)),
-                # FP32: YOLOE-x is tiny (fits easily) and its FP32 text embeddings would
-                # otherwise clash with a half-precision model (Half != float dtype error).
                 half=False, device=0, verbose=False,
-            )
-            if imgsz:
-                track_kw["imgsz"] = int(imgsz)
-            for result in model.track(**track_kw):
+            ):
                 yield result
 
 
@@ -271,7 +261,7 @@ def _set(job_id: str, **kw) -> None:
 
 
 def run_detection(job_id: str, engine, video_path: Path, concepts: list[str],
-                  conf: float, stride: int, imgsz: int | None = None) -> None:
+                  conf: float, stride: int) -> None:
     """Background worker: stream the chosen engine over the video, draw boxes, write
     annotated.mp4. If the engine crashes mid-stream, the frames processed so far are still
     encoded and saved, so a partial result stays watchable."""
@@ -312,7 +302,7 @@ def run_detection(job_id: str, engine, video_path: Path, concepts: list[str],
         seen_ids: dict[str, set] = {c: set() for c in concepts}
         _set(job_id, status="running", total=max(1, total // max(1, stride)), backend=engine.name)
 
-        for result in engine.stream(str(video_path), concepts, conf, stride, imgsz):
+        for result in engine.stream(str(video_path), concepts, conf, stride):
             frame, current = annotate_result(result, concepts, seen_ids)
             if state["writer"] is None:
                 h, w = frame.shape[:2]
@@ -349,8 +339,7 @@ def run_detection(job_id: str, engine, video_path: Path, concepts: list[str],
         _set(job_id, **upd)
 
 
-def live_mjpeg(engine, video_path: Path, concepts: list[str], conf: float, stride: int,
-               imgsz: int | None = None):
+def live_mjpeg(engine, video_path: Path, concepts: list[str], conf: float, stride: int):
     """Generator: stream annotated frames as MJPEG (multipart/x-mixed-replace).
 
     Boxes + a live HUD are drawn straight onto each JPEG, so the browser just points an
@@ -361,7 +350,7 @@ def live_mjpeg(engine, video_path: Path, concepts: list[str], conf: float, strid
     last = time.time()
     fps = 0.0
     try:
-        for result in engine.stream(str(video_path), concepts, conf, stride, imgsz):
+        for result in engine.stream(str(video_path), concepts, conf, stride):
             frame, current = annotate_result(result, concepts, seen_ids)
             now = time.time()
             dt = now - last
@@ -437,8 +426,6 @@ async def detect(payload: dict) -> JSONResponse:
 
     conf = float(payload.get("score_threshold", 0.4))
     stride = int(payload.get("frame_stride", 1))
-    imgsz = payload.get("imgsz")  # None => engine default (SAM 3: 768). Lower if OOM.
-    imgsz = int(imgsz) if imgsz else None
 
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
@@ -446,7 +433,7 @@ async def detect(payload: dict) -> JSONResponse:
                         "concepts": concepts, "backend": engine.name, "error": None, "output": None}
     threading.Thread(
         target=run_detection,
-        args=(job_id, engine, video_path, concepts, conf, stride, imgsz),
+        args=(job_id, engine, video_path, concepts, conf, stride),
         daemon=True,
     ).start()
     return JSONResponse({"job_id": job_id, "backend": engine.name})
@@ -454,8 +441,7 @@ async def detect(payload: dict) -> JSONResponse:
 
 @app.get("/live")
 def live(video: str, prompt: str, backend: str = "yoloe",
-         score_threshold: float = 0.4, frame_stride: int = 1,
-         imgsz: int | None = None) -> StreamingResponse:
+         score_threshold: float = 0.4, frame_stride: int = 1) -> StreamingResponse:
     """Live MJPEG preview — boxes stream in as the GPU finishes each frame.
 
     Defaults to YOLOE (fast enough to feel live, ~7-8 fps on this card). SAM 3 works too
@@ -472,8 +458,7 @@ def live(video: str, prompt: str, backend: str = "yoloe",
         raise HTTPException(404, f"Video not found in input/: {video}")
     return StreamingResponse(
         live_mjpeg(engine, video_path, concepts,
-                   float(score_threshold), int(max(1, frame_stride)),
-                   int(imgsz) if imgsz else None),
+                   float(score_threshold), int(max(1, frame_stride))),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
