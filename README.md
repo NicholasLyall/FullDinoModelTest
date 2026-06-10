@@ -99,40 +99,56 @@ lower it to catch more boxes (more detections, more false positives).
 
 ## Hardware notes (read these — the target machine is specific)
 
-Target: **Ubuntu 24.04, RTX 5050 Laptop (Blackwell, 8 GB VRAM), driver 595.**
+Target: **Ubuntu 26, RTX 5070 Ti (Blackwell, 16 GB VRAM).**
+
+> Originally built/verified on an RTX 5050 Laptop (Blackwell, 8 GB). The 5070 Ti is
+> the **same Blackwell architecture (`sm_120`)**, just a faster desktop chip with more
+> VRAM, so nothing about the model/CUDA setup changes — it's the same cu128 build.
+> The app's settings are tuned for 8 GB (FP16, `imgsz=1024`) and run unchanged on the
+> 5070 Ti with plenty of headroom to spare.
 
 1. **PyTorch must be a CUDA 12.8+ build.** Blackwell is compute capability
    `sm_120`; older wheels throw *"no kernel image available for execution on the
-   device."* Install with:
+   device."* The `setup.sh` script installs the cu128 build for you. Manual:
    ```bash
    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
    ```
    Verify: `python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"`
 
-2. **8 GB VRAM ceiling.** SAM 3.1 runs ~4 GB in FP16, so it fits — but load
-   nothing else onto the GPU at the same time (close UE/other GPU apps). Run the
-   model in FP16/half precision. If you ever hit OOM, lower input resolution or
-   raise `frame_stride`.
+2. **Python version on Ubuntu 26.** Ubuntu 26 may default to a Python newer than the
+   pinned `torch 2.11.0+cu128` wheels support (cp39–cp313). `setup.sh` prefers
+   `python3.12`/`python3.13` automatically. If the default is too new and install
+   fails, `sudo apt install python3.12 python3.12-venv` and re-run.
 
-3. **Xid 120 crash risk — matters MORE with SAM 3 than with a light detector.**
-   SAM 3.1 does more work per frame than Grounding DINO, so sustained GPU load is
-   higher and the driver GSP-panic on this GPU is more likely on long clips.
-   Mitigate, non-optional:
-   - `frame_stride` option (process every Nth frame; default 1, use 3–5 for long
-     videos) to cut load and speed up.
-   - **Resumable:** checkpoint progress (last processed frame + boxes/track state)
-     to disk periodically so a crash + rerun continues instead of restarting.
-   - Process in chunks; reboot if Xid 120 hits, then resume.
+3. **VRAM: 16 GB is plenty.** SAM 3.1 runs ~4 GB in FP16; YOLOE-26 is tiny. No OOM
+   concern on this card. If you want to catch smaller/distant objects you *can* raise
+   `imgsz` (e.g. 1280) for the extra headroom — but the defaults are fine. If you ever
+   do hit OOM (e.g. very high-res source), lower input resolution or raise `frame_stride`.
+
+4. **Long-clip Xid 120 GSP-panic** was a sustained-load risk noted for the laptop GPU;
+   a desktop 5070 Ti has more power/cooling headroom, so it's less of a concern. No
+   checkpoint/resume is built in by design — `frame_stride` and the score threshold
+   are ordinary UX controls, not crash mitigations.
 
 ---
 
 ## Setup
 
+One command — creates the venv, installs the cu128 PyTorch + all pinned deps, and
+sanity-checks the GPU:
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
-pip install ultralytics fastapi uvicorn opencv-python pillow
-# SAM 3 weights: follow Ultralytics' SAM 3 docs to fetch the sam3 checkpoint
+bash setup.sh
+```
+
+Manual equivalent, if you prefer:
+
+```bash
+python3.12 -m venv .venv && source .venv/bin/activate
+pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+# SAM 3 weights: request access at https://huggingface.co/facebook/sam3,
+# download sam3.pt, and place it in the project root.
 ```
 
 ## Run
