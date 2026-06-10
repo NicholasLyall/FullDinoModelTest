@@ -147,7 +147,8 @@ class Sam3Engine:
     # constructor param, so a busy street scene balloons unbounded — this cap is the
     # actual OOM fix. Lowest-score new detections get dropped once the cap is hit
     # (upstream logs "hitting max_num_objects" when that happens).
-    MAX_TRACKED_OBJECTS = 64
+    # 64 still overran 16 GB on real clips; 10 is the empirical ceiling there.
+    MAX_TRACKED_OBJECTS = 10
 
     def __init__(self) -> None:
         self._predictor = None
